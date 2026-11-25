@@ -2,7 +2,7 @@
 
 Um utilitário visual moderno, didático e **ultra-leve** para Windows e placas de vídeo **NVIDIA GeForce** (otimizado para placas como a **GeForce RTX 3060 Ti** e compatíveis).
 
-Diferente de ferramentas legadas que rodavam apenas na bandeja ou funcionavam para um único jogo, o **VibranceApp v2.0** conta com uma interface gráfica completa em Dark Mode, suporte a múltiplos jogos personalizados, teste ao vivo no monitor e explicações didáticas integradas.
+Diferente de ferramentas legadas que rodavam apenas na bandeja ou funcionavam para um único jogo, o **VibranceApp v2.1** conta com um painel único integrado em Dark Mode, salvamento automático instantâneo, detecção visual de janela ativa em tempo real e 100% de estabilidade.
 
 ---
 
@@ -11,21 +11,17 @@ Diferente de ferramentas legadas que rodavam apenas na bandeja ou funcionavam pa
 1. **Impacto Zero no Desempenho dos Jogos:**
    - Consumo de CPU: **0.0%** (intervalo passivo de detecção de foco).
    - Consumo de memória RAM: **~2.5 MB a 4 MB**.
-   - Tamanho do binário nativo compilado: **259 KB** (executável C++ puro, sem instalador pesado e sem depender de Electron ou runtimes gigantescos).
+   - Tamanho do binário nativo compilado: **~260 KB** (executável C++ puro, sem instalador pesado e sem depender de Electron ou runtimes gigantescos).
 2. **100% Anti-Cheat Safe (VAC, Vanguard, Easy Anti-Cheat, BattlEye):**
    - **Zero Injeção:** Não injeta código ou DLLs dentro dos processos de jogos.
    - Comunica-se exclusivamente com a API oficial do driver NVIDIA (`nvapi64.dll`).
-3. **Gerenciador Multi-Jogos Completo:**
-   - Já vem pré-configurado com os principais títulos: **Counter-Strike 2, Valorant, Apex Legends, Warzone / Call of Duty, Fortnite, Overwatch 2, Rainbow Six Siege**.
-   - Permite adicionar **qualquer jogo** do seu computador:
-     - Botão **"🔍 Detectar Abertos"**: lista os processos ativos no Windows para você selecionar o jogo com 1 clique.
-     - Botão **"📁 Procurar .exe"**: selecione o arquivo executável direto pelo Explorador de Arquivos.
-4. **Teste Rápido / Ao Vivo (Live Preview):**
-   - Aba exclusiva com sliders de saturação (0% a 100%) e nitidez para testar e ver a imagem mudando em tempo real na tela antes mesmo de abrir os jogos.
-   - Botão para restaurar instantaneamente para o padrão da Área de Trabalho (50%).
-5. **Modo Janela / Sem Bordas vs Tela Cheia Exclusiva:**
-   - Ajustável individualmente por jogo.
-6. **Bandeja do Sistema (System Tray):**
+3. **Painel Unificado & Sem Complicações:**
+   - Tudo em uma única tela: configure o Vibrance da Área de Trabalho (Windows) e o Vibrance individual de cada jogo.
+   - **Salvamento Automático Instantâneo:** Ao mexer no slider ou adicionar jogos, as configurações são salvas na hora.
+   - **Monitoramento Visual em Tempo Real:** Mostra na tela o processo em primeiro plano (`Janela Ativa: [ cs2.exe ]`) e a saturação ativa no monitor.
+4. **Detecção Resiliente com Dupla Camada (Anti-Cheat / Elevados):**
+   - Utiliza `QueryFullProcessImageNameW` com fallback automático para `CreateToolhelp32Snapshot`, garantindo detecção precisa mesmo para jogos que rodam com anti-cheat ou privilégios de Administrador.
+5. **Bandeja do Sistema (System Tray):**
    - O botão de fechar (X) minimiza automaticamente para a bandeja próxima ao relógio, continuando ativo de forma silenciosa.
    - Duplo clique no ícone reabre a janela principal instantaneamente.
    - Opção para iniciar automaticamente com o Windows (gravado no Registro).
@@ -66,14 +62,16 @@ python vibrance_gui.py
 
 ---
 
-## 📖 Guia Didático: Entendendo as Opções
+## 📖 Guia Didático: Entendendo as Opções e Funcionamento
 
-* **O que é Digital Vibrance?**
-  Ajusta o processamento cromático da placa de vídeo antes de enviar os quadros para o monitor. Em jogos de tiro, aumenta a separação entre cores frias do cenário e cores quentes das silhuetas dos adversários, facilitando a identificação de alvos escondidos em cantos escuros.
-* **O que é Nitidez (Image Sharpening)?**
-  Acentua o contraste de bordas e texturas distantes. É crucial para quem joga em resoluções esticadas (como 4:3 1280x960), eliminando a sensação de imagem embaçada provocada pelo monitor ao esticar a resolução.
+* **O que é Digital Vibrance e por que afeta a tela toda?**
+  O *Digital Vibrance* é um ajuste direto nos canais de hardware (LUT) da placa de vídeo NVIDIA antes de enviar o sinal para o monitor. Não existe como alterar a saturação física da tela apenas dentro da moldura de uma janela sem injetar código na memória do jogo (o que causaria banimento por anti-cheats como VAC e Vanguard). Por isso, enquanto o jogo estiver em foco na tela, a placa de vídeo opera com a saturação configurada; ao dar `Alt+Tab` ou fechar o jogo, o VibranceApp restaura instantaneamente os 50% normais da Área de Trabalho.
+
+* **Por que a opção de Nitidez foi removida?**
+  A NVIDIA descontinuou o endpoint de nitidez direta (`NvAPI_OverlaySharpness`) nos drivers modernos das séries RTX 30 e 40 (como a RTX 3060 Ti). Como a chamada não surtia mais efeito nesses drivers mais recentes, a opção foi removida para garantir que o programa contenha 100% de controles funcionais, sem nenhum slider placebo.
+
 * **Como funciona a troca automática?**
-  O aplicativo verifica qual janela está com o foco do usuário no Windows. Ao entrar no jogo, ativa a saturação configurada. Ao sair do jogo ou pressionar `Alt+Tab`, restaura as cores normais (50%) para navegação confortável na internet.
+  O aplicativo monitora passivamente qual janela está em primeiro plano a cada 300ms. Se for um jogo cadastrado (ex: `cs2.exe`), ativa o perfil correspondente. Caso contrário, mantém o padrão da Área de Trabalho. O badge `Janela Ativa Detectada` no topo da janela indica exatamente o que está em foco em tempo real.
 
 ---
 
