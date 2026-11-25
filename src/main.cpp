@@ -10,6 +10,8 @@
 #include <commdlg.h>
 #include <shlobj.h>
 #include <shellapi.h>
+#include <lowlevelmonitorconfigurationapi.h>
+#include <physicalmonitorenumerationapi.h>
 #include <vector>
 #include <string>
 #include <cwctype>
@@ -55,20 +57,30 @@ static NvAPI_GPU_GetFullName_t        g_NvAPI_GetGpuName = nullptr;
 
 static HMODULE                        g_hNvApiDll = nullptr;
 static std::vector<void*>             g_displayHandles;
-static std::wstring                   g_gpuName = L"NVIDIA GeForce (Detectando...)";
+static std::wstring                   g_gpuName = L"NVIDIA GeForce";
 static bool                           g_nvapiReady = false;
+
+// --- DDC/CI Hardware Monitor (VESA MCCS 0x87 = Sharpness / Nitidez) ---
+static std::vector<PHYSICAL_MONITOR>  g_physicalMonitors;
+static bool                           g_monitorSupportsSharpness = false;
+static DWORD                          g_monitorMinSharpness = 0;
+static DWORD                          g_monitorMaxSharpness = 100;
+static DWORD                          g_monitorCurSharpness = 50;
+static std::wstring                   g_monitorName = L"";
 
 // --- Estrutura de Perfis de Jogos ---
 struct GameProfile {
     std::wstring name;
     std::wstring exeName;
     int vibrance;       // 50 a 100%
+    int sharpness;      // 0 a 100% (Nitidez física no monitor via DDC/CI)
     bool applyWindowed; // true: modo janela + fullscreen, false: fullscreen apenas
     bool enabled;
 };
 
 struct AppSettings {
     int windowsVibrance = 50;
+    int windowsSharpness = 50;
     bool startWithWindows = false;
     bool minimizeToTrayOnClose = true;
     int pollingIntervalMs = 300; // 300 ms para resposta rápida e 0% CPU
@@ -92,7 +104,7 @@ static HFONT g_fontSmall = nullptr;
 // Pincéis Dark
 static HBRUSH g_hBrushBg = nullptr;      // #121216
 static HBRUSH g_hBrushCard = nullptr;    // #1a1a24
-static HBRUSH g_hBrushInput = nullptr;   // #252532
+static HBRUSH g_hBrushInput = nullptr;   // #22222e
 
 static bool g_isGameActive = false;
 static std::wstring g_activeGameName = L"";
@@ -118,16 +130,23 @@ enum ControlIDs {
     IDC_BTN_BROWSE_EXE,
     IDC_EDIT_GAME_NAME,
     IDC_EDIT_GAME_EXE,
-    IDC_SLIDER_GAME_VIB,
+    
+    // Sliders do Jogo
+    IDC_SLIDER_GAME_VIB = 220,
     IDC_LBL_GAME_VIB_VAL,
+    IDC_SLIDER_GAME_SHARP,
+    IDC_LBL_GAME_SHARP_VAL,
     IDC_BTN_TEST_GAME_VIB,
+    IDC_BTN_TEST_GAME_SHARP,
     IDC_CHK_WINDOWED,
     IDC_CHK_PROFILE_ENABLED,
 
-    // Desktop Vibrance & Sistema
+    // Desktop & Sistema
     IDC_SLIDER_DESKTOP_VIB = 300,
     IDC_LBL_DESKTOP_VIB_VAL,
-    IDC_BTN_TEST_DESKTOP_VIB,
+    IDC_SLIDER_DESKTOP_SHARP,
+    IDC_LBL_DESKTOP_SHARP_VAL,
+    IDC_BTN_TEST_DESKTOP,
     IDC_CHK_AUTOSTART,
     IDC_CHK_MINIMIZE_TRAY,
 
@@ -141,6 +160,61 @@ enum ControlIDs {
 static std::vector<HWND> g_tabMainControls;
 static std::vector<HWND> g_tabGuideControls;
 static HWND g_tabButtons[2];
+
+// --- DDC/CI Hardware Monitor Implementation ---
+BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM) {
+    DWORD numMonitors = 0;
+    if (GetNumberOfPhysicalMonitorsFromHMONITOR(hMonitor, &numMonitors) && numMonitors > 0) {
+        std::vector<PHYSICAL_MONITOR> monitors(numMonitors);
+        if (GetPhysicalMonitorsFromHMONITOR(hMonitor, numMonitors, monitors.data())) {
+            for (DWORD i = 0; i < numMonitors; ++i) {
+                g_physicalMonitors.push_back(monitors[i]);
+            }
+        }
+    }
+    return TRUE;
+}
+
+void InitDdcMonitors() {
+    g_physicalMonitors.clear();
+    EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, 0);
+    g_monitorSupportsSharpness = false;
+    for (auto& pm : g_physicalMonitors) {
+        MC_VCP_CODE_TYPE codeType;
+        DWORD cur = 0, maxV = 100;
+        // VESA VCP Code 0x87 = Sharpness / Nitidez
+        if (GetVCPFeatureAndVCPFeatureReply(pm.hPhysicalMonitor, 0x87, &codeType, &cur, &maxV)) {
+            g_monitorMinSharpness = 0;
+            g_monitorMaxSharpness = (maxV > 0) ? maxV : 100;
+            g_monitorCurSharpness = cur;
+            g_monitorSupportsSharpness = true;
+            if (pm.szPhysicalMonitorDescription[0] != L'\0') {
+                g_monitorName = pm.szPhysicalMonitorDescription;
+            } else {
+                g_monitorName = L"Monitor DDC/CI";
+            }
+            break; // Monitor principal configurado
+        }
+    }
+}
+
+void ApplyMonitorSharpnessPercent(int percent) {
+    if (!g_monitorSupportsSharpness) return;
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+
+    DWORD target = g_monitorMinSharpness + (DWORD)((float)(g_monitorMaxSharpness - g_monitorMinSharpness) * (percent / 100.0f) + 0.5f);
+    for (auto& pm : g_physicalMonitors) {
+        SetVCPFeature(pm.hPhysicalMonitor, 0x87, target);
+    }
+}
+
+void CleanupDdcMonitors() {
+    if (!g_physicalMonitors.empty()) {
+        DestroyPhysicalMonitors((DWORD)g_physicalMonitors.size(), g_physicalMonitors.data());
+        g_physicalMonitors.clear();
+    }
+}
 
 // --- Persistência de Dados (INI) ---
 std::wstring GetConfigDir() {
@@ -159,13 +233,13 @@ std::wstring GetProfilesFilePath() {
 
 void SetDefaultProfiles() {
     g_settings.profiles.clear();
-    g_settings.profiles.push_back({L"Counter-Strike 2", L"cs2.exe", 100, true, true});
-    g_settings.profiles.push_back({L"Valorant", L"valorant-win64-shipping.exe", 85, true, true});
-    g_settings.profiles.push_back({L"Apex Legends", L"r5apex.exe", 80, true, true});
-    g_settings.profiles.push_back({L"Call of Duty / Warzone", L"cod.exe", 85, true, true});
-    g_settings.profiles.push_back({L"Fortnite", L"fortniteclient-win64-shipping.exe", 75, true, true});
-    g_settings.profiles.push_back({L"Overwatch 2", L"overwatch.exe", 80, true, true});
-    g_settings.profiles.push_back({L"Rainbow Six Siege", L"rainbowsix.exe", 85, true, true});
+    g_settings.profiles.push_back({L"Counter-Strike 2", L"cs2.exe", 100, 80, true, true});
+    g_settings.profiles.push_back({L"Valorant", L"valorant-win64-shipping.exe", 85, 70, true, true});
+    g_settings.profiles.push_back({L"Apex Legends", L"r5apex.exe", 80, 70, true, true});
+    g_settings.profiles.push_back({L"Call of Duty / Warzone", L"cod.exe", 85, 75, true, true});
+    g_settings.profiles.push_back({L"Fortnite", L"fortniteclient-win64-shipping.exe", 75, 60, true, true});
+    g_settings.profiles.push_back({L"Overwatch 2", L"overwatch.exe", 80, 65, true, true});
+    g_settings.profiles.push_back({L"Rainbow Six Siege", L"rainbowsix.exe", 85, 75, true, true});
 }
 
 bool IsAutostartEnabled() {
@@ -200,6 +274,7 @@ void SaveSettings();
 void LoadSettings() {
     std::wstring path = GetProfilesFilePath();
     g_settings.windowsVibrance = GetPrivateProfileIntW(L"General", L"WindowsVibrance", 50, path.c_str());
+    g_settings.windowsSharpness = GetPrivateProfileIntW(L"General", L"WindowsSharpness", 50, path.c_str());
     g_settings.minimizeToTrayOnClose = (GetPrivateProfileIntW(L"General", L"MinimizeToTray", 1, path.c_str()) != 0);
     g_settings.pollingIntervalMs = GetPrivateProfileIntW(L"General", L"PollingInterval", 300, path.c_str());
     g_settings.startWithWindows = IsAutostartEnabled();
@@ -217,12 +292,13 @@ void LoadSettings() {
             GetPrivateProfileStringW(sec.c_str(), L"Name", L"Game", name, 128, path.c_str());
             GetPrivateProfileStringW(sec.c_str(), L"Exe", L"game.exe", exe, 128, path.c_str());
             int vib = GetPrivateProfileIntW(sec.c_str(), L"Vibrance", 100, path.c_str());
+            int sharp = GetPrivateProfileIntW(sec.c_str(), L"Sharpness", 80, path.c_str());
             bool win = (GetPrivateProfileIntW(sec.c_str(), L"Windowed", 1, path.c_str()) != 0);
             bool en = (GetPrivateProfileIntW(sec.c_str(), L"Enabled", 1, path.c_str()) != 0);
 
             std::wstring exeLower(exe);
             for (auto& c : exeLower) c = towlower(c);
-            g_settings.profiles.push_back({name, exeLower, vib, win, en});
+            g_settings.profiles.push_back({name, exeLower, vib, sharp, win, en});
         }
     }
 }
@@ -230,6 +306,7 @@ void LoadSettings() {
 void SaveSettings() {
     std::wstring path = GetProfilesFilePath();
     WritePrivateProfileStringW(L"General", L"WindowsVibrance", std::to_wstring(g_settings.windowsVibrance).c_str(), path.c_str());
+    WritePrivateProfileStringW(L"General", L"WindowsSharpness", std::to_wstring(g_settings.windowsSharpness).c_str(), path.c_str());
     WritePrivateProfileStringW(L"General", L"MinimizeToTray", g_settings.minimizeToTrayOnClose ? L"1" : L"0", path.c_str());
     WritePrivateProfileStringW(L"General", L"PollingInterval", std::to_wstring(g_settings.pollingIntervalMs).c_str(), path.c_str());
 
@@ -239,6 +316,7 @@ void SaveSettings() {
         WritePrivateProfileStringW(sec.c_str(), L"Name", g_settings.profiles[i].name.c_str(), path.c_str());
         WritePrivateProfileStringW(sec.c_str(), L"Exe", g_settings.profiles[i].exeName.c_str(), path.c_str());
         WritePrivateProfileStringW(sec.c_str(), L"Vibrance", std::to_wstring(g_settings.profiles[i].vibrance).c_str(), path.c_str());
+        WritePrivateProfileStringW(sec.c_str(), L"Sharpness", std::to_wstring(g_settings.profiles[i].sharpness).c_str(), path.c_str());
         WritePrivateProfileStringW(sec.c_str(), L"Windowed", g_settings.profiles[i].applyWindowed ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(sec.c_str(), L"Enabled", g_settings.profiles[i].enabled ? L"1" : L"0", path.c_str());
     }
@@ -340,7 +418,7 @@ std::wstring GetProcessNameFromPid(DWORD pid) {
         CloseHandle(hProc);
     }
 
-    // 2. Se falhar (ex: jogos protegidos por anti-cheat / privilégios), usar Toolhelp32Snapshot
+    // 2. Fallback: Toolhelp32Snapshot
     if (procName.empty()) {
         HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnap != INVALID_HANDLE_VALUE) {
@@ -407,7 +485,6 @@ void CheckActiveGameFocus() {
     std::wstring fgProc = GetForegroundProcess(&fgHwnd);
     if (fgProc.empty()) return;
 
-    // Se a janela em foco for a própria janela do VibranceApp, manter estado
     if (fgHwnd == g_hMainWindow) {
         return;
     }
@@ -416,7 +493,7 @@ void CheckActiveGameFocus() {
     HWND hTracker = GetDlgItem(g_hMainWindow, IDC_LIVE_TRACKER);
     if (hTracker && fgProc != g_currentFgProcess) {
         g_currentFgProcess = fgProc;
-        std::wstring trackerText = L"Janela Ativa Detectada: [" + fgProc + L"]";
+        std::wstring trackerText = L"Janela Ativa: [" + fgProc + L"]";
         SetWindowTextW(hTracker, trackerText.c_str());
     }
 
@@ -435,16 +512,20 @@ void CheckActiveGameFocus() {
     if (matchedProfile) {
         if (!g_isGameActive || g_activeGameName != matchedProfile->name) {
             ApplyVibrancePercent(matchedProfile->vibrance);
+            ApplyMonitorSharpnessPercent(matchedProfile->sharpness);
             g_isGameActive = true;
             g_activeGameName = matchedProfile->name;
-            UpdateStatusUI(matchedProfile->name + L" (Saturação: " + std::to_wstring(matchedProfile->vibrance) + L"%)", true);
+            UpdateStatusUI(matchedProfile->name + L" (Vibrance: " + std::to_wstring(matchedProfile->vibrance) + 
+                           L"% | Nitidez: " + std::to_wstring(matchedProfile->sharpness) + L"%)", true);
         }
     } else {
         if (g_isGameActive) {
             ApplyVibrancePercent(g_settings.windowsVibrance);
+            ApplyMonitorSharpnessPercent(g_settings.windowsSharpness);
             g_isGameActive = false;
             g_activeGameName = L"";
-            UpdateStatusUI(L"Área de Trabalho (Saturação: " + std::to_wstring(g_settings.windowsVibrance) + L"%)", false);
+            UpdateStatusUI(L"Área de Trabalho (Vibrance: " + std::to_wstring(g_settings.windowsVibrance) + 
+                           L"% | Nitidez: " + std::to_wstring(g_settings.windowsSharpness) + L"%)", false);
         }
     }
 }
@@ -457,8 +538,9 @@ void RefreshProfileList() {
 
     for (size_t i = 0; i < g_settings.profiles.size(); i++) {
         std::wstring item = (g_settings.profiles[i].enabled ? L"✓ " : L"✗ ") +
-                            g_settings.profiles[i].name + L" (" +
-                            std::to_wstring(g_settings.profiles[i].vibrance) + L"%)";
+                            g_settings.profiles[i].name + L" (V:" +
+                            std::to_wstring(g_settings.profiles[i].vibrance) + L"% | N:" +
+                            std::to_wstring(g_settings.profiles[i].sharpness) + L"%)";
         SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)item.c_str());
     }
 
@@ -479,6 +561,9 @@ void LoadSelectedProfileToInputs() {
 
     SendMessageW(GetDlgItem(g_hMainWindow, IDC_SLIDER_GAME_VIB), TBM_SETPOS, TRUE, p.vibrance);
     SetWindowTextW(GetDlgItem(g_hMainWindow, IDC_LBL_GAME_VIB_VAL), (std::to_wstring(p.vibrance) + L"%").c_str());
+
+    SendMessageW(GetDlgItem(g_hMainWindow, IDC_SLIDER_GAME_SHARP), TBM_SETPOS, TRUE, p.sharpness);
+    SetWindowTextW(GetDlgItem(g_hMainWindow, IDC_LBL_GAME_SHARP_VAL), (std::to_wstring(p.sharpness) + L"%").c_str());
 
     SendMessageW(GetDlgItem(g_hMainWindow, IDC_CHK_WINDOWED), BM_SETCHECK, p.applyWindowed ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(GetDlgItem(g_hMainWindow, IDC_CHK_PROFILE_ENABLED), BM_SETCHECK, p.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -523,7 +608,7 @@ void ShowRunningProcessesDialog(HWND hParent) {
     std::sort(exes.begin(), exes.end());
 
     if (exes.empty()) {
-        MessageBoxW(hParent, L"Nenhum processo de jogo ou aplicativo detectado no momento.", L"Processos", MB_OK);
+        MessageBoxW(hParent, L"Nenhum processo detectado no momento.", L"Processos", MB_OK);
         return;
     }
 
@@ -569,7 +654,6 @@ void ShowRunningProcessesDialog(HWND hParent) {
                     baseName[0] = towupper(baseName[0]);
                     SetWindowTextW(GetDlgItem(hParent, IDC_EDIT_GAME_NAME), baseName.c_str());
 
-                    // Salvar no perfil selecionado
                     if (g_selectedProfileIndex >= 0 && g_selectedProfileIndex < (int)g_settings.profiles.size()) {
                         g_settings.profiles[g_selectedProfileIndex].exeName = exes[sel];
                         g_settings.profiles[g_selectedProfileIndex].name = baseName;
@@ -625,7 +709,7 @@ void ShowTrayMenu(HWND hwnd, POINT pt) {
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING | MF_GRAYED, IDM_TRAY_STATUS,
                 g_isGameActive ? (L"🎮 Jogo Ativo: " + g_activeGameName).c_str() : L"🟢 Modo Standby (Windows)");
-    AppendMenuW(hMenu, MF_STRING, IDM_TRAY_RESTORE_WIN, L"Restaurar Cores Padrão (50%)");
+    AppendMenuW(hMenu, MF_STRING, IDM_TRAY_RESTORE_WIN, L"Restaurar Padrão do Windows");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_EXIT, L"Sair");
 
@@ -667,7 +751,7 @@ void DrawStyledButton(LPDRAWITEMSTRUCT dis) {
         fgColor = RGB(255, 255, 255);
         borderColor = bgColor;
     }
-    else if (id == IDC_BTN_TEST_GAME_VIB || id == IDC_BTN_TEST_DESKTOP_VIB) {
+    else if (id == IDC_BTN_TEST_GAME_VIB || id == IDC_BTN_TEST_GAME_SHARP || id == IDC_BTN_TEST_DESKTOP) {
         bgColor = isPressed ? RGB(29, 78, 216) : RGB(37, 99, 235);
         fgColor = RGB(255, 255, 255);
         borderColor = bgColor;
@@ -734,33 +818,31 @@ void OnPaint(HWND hwnd) {
 
     // 4. Desenho de Cards por Aba
     if (g_currentTab == 0) {
-        // Aba 0: Principal -> Card Esquerda (Lista), Card Direita Superior (Config Jogo), Card Direita Inferior (Desktop)
         HBRUSH hCardBrush = CreateSolidBrush(RGB(26, 26, 36));
         HPEN hCardPen = CreatePen(PS_SOLID, 1, RGB(44, 44, 58));
         SelectObject(hdc, hCardBrush);
         SelectObject(hdc, hCardPen);
 
         // Card Lista (Esquerda)
-        RoundRect(hdc, 22, 120, 290, 580, 10, 10);
+        RoundRect(hdc, 22, 120, 290, 640, 10, 10);
         // Card Edição do Jogo (Direita Superior)
-        RoundRect(hdc, 302, 120, 818, 440, 10, 10);
-        // Card Área de Trabalho & Sistema (Direita Inferior)
-        RoundRect(hdc, 302, 452, 818, 580, 10, 10);
+        RoundRect(hdc, 302, 120, 828, 485, 10, 10);
+        // Card Área de Trabalho & Monitor (Direita Inferior)
+        RoundRect(hdc, 302, 497, 828, 640, 10, 10);
 
         DeleteObject(hCardBrush);
         DeleteObject(hCardPen);
     }
     else if (g_currentTab == 1) {
-        // Aba 1: Guia Didático -> 4 Cards Informativos
         HBRUSH hCardBrush = CreateSolidBrush(RGB(26, 26, 36));
         HPEN hCardPen = CreatePen(PS_SOLID, 1, RGB(44, 44, 58));
         SelectObject(hdc, hCardBrush);
         SelectObject(hdc, hCardPen);
 
-        RoundRect(hdc, 25, 125, 815, 225, 10, 10);
-        RoundRect(hdc, 25, 235, 815, 335, 10, 10);
-        RoundRect(hdc, 25, 345, 815, 455, 10, 10);
-        RoundRect(hdc, 25, 465, 815, 575, 10, 10);
+        RoundRect(hdc, 25, 125, 825, 235, 10, 10);
+        RoundRect(hdc, 25, 245, 825, 365, 10, 10);
+        RoundRect(hdc, 25, 375, 825, 505, 10, 10);
+        RoundRect(hdc, 25, 515, 825, 635, 10, 10);
 
         DeleteObject(hCardBrush);
         DeleteObject(hCardPen);
@@ -770,38 +852,38 @@ void OnPaint(HWND hwnd) {
         // Card 1: Como Funciona no Monitor
         SelectObject(hdc, g_fontBold);
         SetTextColor(hdc, RGB(56, 189, 248));
-        TextOutW(hdc, 45, 140, L"🖥️ Por que a saturação afeta o monitor por inteiro?", 52);
+        TextOutW(hdc, 45, 138, L"🖥️ Como Funciona o Digital Vibrance (Saturação NVIDIA)", 53);
         SelectObject(hdc, g_fontRegular);
         SetTextColor(hdc, RGB(200, 200, 212));
-        RECT rc1 = {45, 165, 795, 220};
-        DrawTextW(hdc, L"O Digital Vibrance é um recurso físico de hardware da sua GPU NVIDIA que processa o sinal de vídeo que vai para o monitor. Não é possível saturar apenas uma janela isolada sem afetar a tela. O que o VibranceApp faz de forma inteligente é: quando o jogo está em foco, eleva o monitor para o nível desejado (ex: 100%). Ao dar Alt+Tab ou sair do jogo, volta instantaneamente aos 50% normais do Windows.", -1, &rc1, DT_WORDBREAK | DT_NOPREFIX);
+        RECT rc1 = {45, 162, 805, 225};
+        DrawTextW(hdc, L"O Digital Vibrance é um recurso físico de hardware da sua GPU NVIDIA que processa os canais de cor na saída de vídeo antes de enviar os quadros para o monitor. O VibranceApp detecta quando seu jogo entra em primeiro plano e aplica a saturação escolhida; ao dar Alt+Tab ou fechar o jogo, restaura instantaneamente os 50% normais da Área de Trabalho.", -1, &rc1, DT_WORDBREAK | DT_NOPREFIX);
 
-        // Card 2: 100% Anti-Cheat Safe
+        // Card 2: Como Funciona a Nitidez por Hardware (DDC/CI)
         SelectObject(hdc, g_fontBold);
         SetTextColor(hdc, RGB(74, 222, 128));
-        TextOutW(hdc, 45, 250, L"🛡️ 100% Seguro Contra Anti-Cheat (VAC, Vanguard, EAC, BattlEye)", 61);
+        TextOutW(hdc, 45, 258, L"🎯 Nitidez por Hardware via Cabo DisplayPort (DDC/CI)", 52);
         SelectObject(hdc, g_fontRegular);
         SetTextColor(hdc, RGB(200, 200, 212));
-        RECT rc2 = {45, 275, 795, 330};
-        DrawTextW(hdc, L"Diferente de filtros ReShade que injetam DLLs dentro dos jogos e causam banimento, o VibranceApp opera 100% externamente. Ele não injeta DLLs, não altera arquivos e não lê memória dos jogos. Ele utiliza exclusivamente as rotinas oficiais do driver da NVIDIA (NVAPI oficial).", -1, &rc2, DT_WORDBREAK | DT_NOPREFIX);
+        RECT rc2 = {45, 282, 805, 355};
+        DrawTextW(hdc, L"Monitores como o seu AOC de 27\" 180Hz possuem suporte nativo ao protocolo VESA DDC/CI. O VibranceApp envia comandos diretos pelo cabo DisplayPort (código VESA 0x87) para ajustar o slider físico de Nitidez do monitor! Isso não consome 0% de placa de vídeo, não gera lag e é 100% indetectável por qualquer anti-cheat (VAC, Vanguard, EAC). Certifique-se de que a opção 'DDC/CI' esteja ativada no menu OSD do seu monitor.", -1, &rc2, DT_WORDBREAK | DT_NOPREFIX);
 
-        // Card 3: Sobre Nitidez
+        // Card 3: Alternativa via Driver NVIDIA (Registro)
         SelectObject(hdc, g_fontBold);
         SetTextColor(hdc, RGB(250, 204, 21));
-        TextOutW(hdc, 45, 360, L"⚠️ Nota Importante sobre Nitidez (Image Sharpening) na Série RTX", 64);
+        TextOutW(hdc, 45, 388, L"⚙️ Opção Alternativa: Reativar Nitidez no Painel NVIDIA", 53);
         SelectObject(hdc, g_fontRegular);
         SetTextColor(hdc, RGB(200, 200, 212));
-        RECT rc3 = {45, 385, 795, 450};
-        DrawTextW(hdc, L"Nas versões modernas do driver NVIDIA para a arquitetura RTX (como a RTX 3060 Ti), a NVIDIA removeu o acesso à API antiga de nitidez direta (0x7A2BC2B2). Por isso, removemos controles de nitidez inoperantes para manter o software 100% funcional. Caso deseje nitidez adicional, recomendamos ativar o Image Scaling no Painel de Controle da NVIDIA ou o filtro Nitidez no GeForce Experience (Alt+F3).", -1, &rc3, DT_WORDBREAK | DT_NOPREFIX);
+        RECT rc3 = {45, 412, 805, 495};
+        DrawTextW(hdc, L"Caso o seu monitor não responda ao comando DDC/CI, você também pode reativar o clássico slider de 'Nitidez da Imagem' no Painel de Controle da NVIDIA executando o arquivo 'Ativar_Nitidez_NVIDIA.reg' incluído na pasta do programa. Ele configura a chave EnableGR535=0 no registro e reativa a nitidez diretamente no driver GeForce.", -1, &rc3, DT_WORDBREAK | DT_NOPREFIX);
 
-        // Card 4: Salvamento Automático
+        // Card 4: 100% Anti-Cheat Safe
         SelectObject(hdc, g_fontBold);
         SetTextColor(hdc, RGB(192, 132, 252));
-        TextOutW(hdc, 45, 480, L"⚡ Salvamento Instantâneo & Detecção Contínua", 44);
+        TextOutW(hdc, 45, 528, L"🛡️ 100% Seguro Contra Anti-Cheat & Salvamento Automático", 55);
         SelectObject(hdc, g_fontRegular);
         SetTextColor(hdc, RGB(200, 200, 212));
-        RECT rc4 = {45, 505, 795, 570};
-        DrawTextW(hdc, L"Qualquer alteração feita nos sliders é salva imediatamente e passa a valer na mesma hora. Você pode verificar na barra inferior do aplicativo exatamente qual janela o Windows está detectando em primeiro plano e qual perfil está ativo em tempo real.", -1, &rc4, DT_WORDBREAK | DT_NOPREFIX);
+        RECT rc4 = {45, 552, 805, 625};
+        DrawTextW(hdc, L"Nenhuma DLL é injetada nos processos de jogos e nenhuma memória é modificada. O aplicativo comunica-se exclusivamente com a GPU e com o monitor. Qualquer alteração nos sliders é salva instantaneamente no arquivo de configuração.", -1, &rc4, DT_WORDBREAK | DT_NOPREFIX);
     }
 
     EndPaint(hwnd, &ps);
@@ -813,7 +895,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_CREATE: {
             g_hMainWindow = hwnd;
 
-            // Ativar Dark Mode Moderno no Windows 10/11
             BOOL darkMode = TRUE;
             DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &darkMode, sizeof(darkMode));
 
@@ -832,75 +913,95 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HWND hTitle = CreateWindowW(L"STATIC", L"VIBRANCE APP", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, 25, 12, 220, 26, hwnd, NULL, NULL, NULL);
             SendMessageW(hTitle, WM_SETFONT, (WPARAM)g_fontTitle, TRUE);
 
-            HWND hSub = CreateWindowW(L"STATIC", L"Controle Automático de Saturação por Jogo (NVIDIA GeForce)", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, 25, 40, 450, 20, hwnd, NULL, NULL, NULL);
+            HWND hSub = CreateWindowW(L"STATIC", L"Controle Automático de Saturação & Nitidez por Jogo", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, 25, 40, 420, 20, hwnd, NULL, NULL, NULL);
             SendMessageW(hSub, WM_SETFONT, (WPARAM)g_fontSmall, TRUE);
 
-            std::wstring gpuText = L"Hardware: " + g_gpuName + L" (" + std::to_wstring(g_displayHandles.size()) + L" Monitor)";
-            HWND hGpu = CreateWindowW(L"STATIC", gpuText.c_str(), WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_NOPREFIX, 480, 22, 335, 20, hwnd, (HMENU)IDC_GPU_LABEL, NULL, NULL);
+            std::wstring ddcStatus = g_monitorSupportsSharpness ? (L" | " + g_monitorName + L" (DDC/CI)") : L" | DDC/CI Ativo";
+            std::wstring gpuText = g_gpuName + ddcStatus;
+            HWND hGpu = CreateWindowW(L"STATIC", gpuText.c_str(), WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_NOPREFIX, 450, 22, 375, 20, hwnd, (HMENU)IDC_GPU_LABEL, NULL, NULL);
             SendMessageW(hGpu, WM_SETFONT, (WPARAM)g_fontSmall, TRUE);
 
-            // --- Barra de Abas Simplificada (2 Abas: Direta e Clara) ---
-            g_tabButtons[0] = CreateWindowW(L"BUTTON", L"🎮 Painel de Jogos & Saturação", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 25, 78, 385, 34, hwnd, (HMENU)IDC_TAB_BTN_MAIN, NULL, NULL);
-            g_tabButtons[1] = CreateWindowW(L"BUTTON", L"ℹ️ Como Funciona & Segurança", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 420, 78, 395, 34, hwnd, (HMENU)IDC_TAB_BTN_GUIDE, NULL, NULL);
+            // --- Barra de Abas ---
+            g_tabButtons[0] = CreateWindowW(L"BUTTON", L"🎮 Painel de Jogos, Saturação e Nitidez", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 25, 78, 395, 34, hwnd, (HMENU)IDC_TAB_BTN_MAIN, NULL, NULL);
+            g_tabButtons[1] = CreateWindowW(L"BUTTON", L"ℹ️ Como Funciona & Nitidez DDC/CI", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 430, 78, 395, 34, hwnd, (HMENU)IDC_TAB_BTN_GUIDE, NULL, NULL);
 
             // ==========================================
-            // ABA 0: PAINEL PRINCIPAL (TUDO EM UMA TELA)
+            // ABA 0: PAINEL PRINCIPAL
             // ==========================================
 
             // Coluna Esquerda: Lista de Jogos
             HWND hLblList = CreateWindowW(L"STATIC", L"Jogos Cadastrados:", WS_CHILD | SS_LEFT | SS_NOPREFIX, 35, 132, 230, 18, hwnd, NULL, NULL, NULL);
-            HWND hList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VSCROLL | LBS_NOTIFY, 35, 155, 240, 365, hwnd, (HMENU)IDC_PROFILE_LIST, NULL, NULL);
+            HWND hList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VSCROLL | LBS_NOTIFY, 35, 155, 240, 425, hwnd, (HMENU)IDC_PROFILE_LIST, NULL, NULL);
 
-            HWND hBtnAdd = CreateWindowW(L"BUTTON", L"+ Novo Jogo", WS_CHILD | BS_OWNERDRAW, 35, 530, 115, 36, hwnd, (HMENU)IDC_BTN_ADD_GAME, NULL, NULL);
-            HWND hBtnRemove = CreateWindowW(L"BUTTON", L"- Remover", WS_CHILD | BS_OWNERDRAW, 160, 530, 115, 36, hwnd, (HMENU)IDC_BTN_REMOVE_GAME, NULL, NULL);
+            HWND hBtnAdd = CreateWindowW(L"BUTTON", L"+ Novo Jogo", WS_CHILD | BS_OWNERDRAW, 35, 590, 115, 36, hwnd, (HMENU)IDC_BTN_ADD_GAME, NULL, NULL);
+            HWND hBtnRemove = CreateWindowW(L"BUTTON", L"- Remover", WS_CHILD | BS_OWNERDRAW, 160, 590, 115, 36, hwnd, (HMENU)IDC_BTN_REMOVE_GAME, NULL, NULL);
 
             // Coluna Direita Superior: Edição do Jogo Selecionado
-            HWND hLblSectionGame = CreateWindowW(L"STATIC", L"Configuração do Jogo Selecionado:", WS_CHILD | SS_LEFT | SS_NOPREFIX, 320, 132, 400, 18, hwnd, NULL, NULL, NULL);
+            HWND hLblSectionGame = CreateWindowW(L"STATIC", L"Configuração do Jogo Selecionado:", WS_CHILD | SS_LEFT | SS_NOPREFIX, 320, 130, 400, 18, hwnd, NULL, NULL, NULL);
 
-            HWND hLblName = CreateWindowW(L"STATIC", L"Nome de Exibição:", WS_CHILD | SS_LEFT | SS_NOPREFIX, 320, 158, 140, 18, hwnd, NULL, NULL, NULL);
-            HWND hEditName = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 320, 178, 480, 26, hwnd, (HMENU)IDC_EDIT_GAME_NAME, NULL, NULL);
+            HWND hLblName = CreateWindowW(L"STATIC", L"Nome de Exibição:", WS_CHILD | SS_LEFT | SS_NOPREFIX, 320, 154, 140, 18, hwnd, NULL, NULL, NULL);
+            HWND hEditName = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 320, 172, 490, 26, hwnd, (HMENU)IDC_EDIT_GAME_NAME, NULL, NULL);
 
-            HWND hLblExe = CreateWindowW(L"STATIC", L"Nome do Executável (.exe):", WS_CHILD | SS_LEFT | SS_NOPREFIX, 320, 212, 180, 18, hwnd, NULL, NULL, NULL);
-            HWND hEditExe = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 320, 232, 235, 26, hwnd, (HMENU)IDC_EDIT_GAME_EXE, NULL, NULL);
+            HWND hLblExe = CreateWindowW(L"STATIC", L"Nome do Executável (.exe):", WS_CHILD | SS_LEFT | SS_NOPREFIX, 320, 202, 180, 18, hwnd, NULL, NULL, NULL);
+            HWND hEditExe = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 320, 220, 245, 26, hwnd, (HMENU)IDC_EDIT_GAME_EXE, NULL, NULL);
 
-            HWND hBtnDetect = CreateWindowW(L"BUTTON", L"🔍 Detectar Aberto", WS_CHILD | BS_OWNERDRAW, 565, 230, 125, 30, hwnd, (HMENU)IDC_BTN_DETECT_RUNNING, NULL, NULL);
-            HWND hBtnBrowse = CreateWindowW(L"BUTTON", L"📁 Procurar .exe", WS_CHILD | BS_OWNERDRAW, 698, 230, 102, 30, hwnd, (HMENU)IDC_BTN_BROWSE_EXE, NULL, NULL);
+            HWND hBtnDetect = CreateWindowW(L"BUTTON", L"🔍 Detectar Aberto", WS_CHILD | BS_OWNERDRAW, 575, 218, 125, 30, hwnd, (HMENU)IDC_BTN_DETECT_RUNNING, NULL, NULL);
+            HWND hBtnBrowse = CreateWindowW(L"BUTTON", L"📁 Procurar .exe", WS_CHILD | BS_OWNERDRAW, 708, 218, 102, 30, hwnd, (HMENU)IDC_BTN_BROWSE_EXE, NULL, NULL);
 
-            HWND hLblVib = CreateWindowW(L"STATIC", L"Saturação quando este jogo estiver em foco:", WS_CHILD | SS_LEFT | SS_NOPREFIX, 320, 272, 380, 18, hwnd, NULL, NULL, NULL);
-            HWND hLblVibVal = CreateWindowW(L"STATIC", L"100%", WS_CHILD | SS_RIGHT | SS_NOPREFIX, 720, 272, 80, 18, hwnd, (HMENU)IDC_LBL_GAME_VIB_VAL, NULL, NULL);
-            HWND hSliderVib = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | TBS_NOTICKS, 320, 294, 480, 30, hwnd, (HMENU)IDC_SLIDER_GAME_VIB, NULL, NULL);
+            // Saturação (Vibrance) no Jogo
+            HWND hLblVib = CreateWindowW(L"STATIC", L"Saturação (Digital Vibrance) no Jogo:", WS_CHILD | SS_LEFT | SS_NOPREFIX, 320, 254, 380, 18, hwnd, NULL, NULL, NULL);
+            HWND hLblVibVal = CreateWindowW(L"STATIC", L"100%", WS_CHILD | SS_RIGHT | SS_NOPREFIX, 730, 254, 80, 18, hwnd, (HMENU)IDC_LBL_GAME_VIB_VAL, NULL, NULL);
+            HWND hSliderVib = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | TBS_NOTICKS, 320, 272, 490, 28, hwnd, (HMENU)IDC_SLIDER_GAME_VIB, NULL, NULL);
             SendMessageW(hSliderVib, TBM_SETRANGE, TRUE, MAKELPARAM(50, 100));
 
-            HWND hBtnTestGame = CreateWindowW(L"BUTTON", L"👁️ Testar Esta Saturação no Monitor (5 segundos)", WS_CHILD | BS_OWNERDRAW, 320, 335, 480, 34, hwnd, (HMENU)IDC_BTN_TEST_GAME_VIB, NULL, NULL);
+            // Nitidez (Sharpness DDC/CI) no Jogo
+            HWND hLblSharp = CreateWindowW(L"STATIC", L"Nitidez no Monitor AOC (Hardware DDC/CI):", WS_CHILD | SS_LEFT | SS_NOPREFIX, 320, 304, 380, 18, hwnd, NULL, NULL, NULL);
+            HWND hLblSharpVal = CreateWindowW(L"STATIC", L"80%", WS_CHILD | SS_RIGHT | SS_NOPREFIX, 730, 304, 80, 18, hwnd, (HMENU)IDC_LBL_GAME_SHARP_VAL, NULL, NULL);
+            HWND hSliderSharp = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | TBS_NOTICKS, 320, 322, 490, 28, hwnd, (HMENU)IDC_SLIDER_GAME_SHARP, NULL, NULL);
+            SendMessageW(hSliderSharp, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
 
-            HWND hChkWin = CreateWindowW(L"BUTTON", L"Ativar também em Modo Janela / Janela Sem Bordas", WS_CHILD | BS_AUTOCHECKBOX, 320, 378, 480, 20, hwnd, (HMENU)IDC_CHK_WINDOWED, NULL, NULL);
-            HWND hChkEn = CreateWindowW(L"BUTTON", L"Perfil Habilitado para este Jogo", WS_CHILD | BS_AUTOCHECKBOX, 320, 404, 480, 20, hwnd, (HMENU)IDC_CHK_PROFILE_ENABLED, NULL, NULL);
+            // Botões de Teste
+            HWND hBtnTestGameVib = CreateWindowW(L"BUTTON", L"👁️ Testar Saturação", WS_CHILD | BS_OWNERDRAW, 320, 358, 240, 34, hwnd, (HMENU)IDC_BTN_TEST_GAME_VIB, NULL, NULL);
+            HWND hBtnTestGameSharp = CreateWindowW(L"BUTTON", L"🎯 Testar Nitidez Monitor", WS_CHILD | BS_OWNERDRAW, 570, 358, 240, 34, hwnd, (HMENU)IDC_BTN_TEST_GAME_SHARP, NULL, NULL);
 
-            // Coluna Direita Inferior: Saturação da Área de Trabalho (Windows Desktop)
-            HWND hLblDesktop = CreateWindowW(L"STATIC", L"Saturação da Área de Trabalho (Quando nenhum jogo estiver aberto):", WS_CHILD | SS_LEFT | SS_NOPREFIX, 320, 465, 420, 18, hwnd, NULL, NULL, NULL);
-            HWND hLblDesktopVal = CreateWindowW(L"STATIC", L"50%", WS_CHILD | SS_RIGHT | SS_NOPREFIX, 740, 465, 60, 18, hwnd, (HMENU)IDC_LBL_DESKTOP_VIB_VAL, NULL, NULL);
-            HWND hSliderDesktop = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | TBS_NOTICKS, 320, 488, 340, 30, hwnd, (HMENU)IDC_SLIDER_DESKTOP_VIB, NULL, NULL);
-            SendMessageW(hSliderDesktop, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
-            SendMessageW(hSliderDesktop, TBM_SETPOS, TRUE, g_settings.windowsVibrance);
+            HWND hChkWin = CreateWindowW(L"BUTTON", L"Ativar também em Modo Janela / Janela Sem Bordas", WS_CHILD | BS_AUTOCHECKBOX, 320, 402, 490, 20, hwnd, (HMENU)IDC_CHK_WINDOWED, NULL, NULL);
+            HWND hChkEn = CreateWindowW(L"BUTTON", L"Perfil Habilitado para este Jogo", WS_CHILD | BS_AUTOCHECKBOX, 320, 426, 490, 20, hwnd, (HMENU)IDC_CHK_PROFILE_ENABLED, NULL, NULL);
 
-            HWND hBtnTestDesktop = CreateWindowW(L"BUTTON", L"Restaurar Desktop", WS_CHILD | BS_OWNERDRAW, 670, 486, 130, 32, hwnd, (HMENU)IDC_BTN_TEST_DESKTOP_VIB, NULL, NULL);
+            // Coluna Direita Inferior: Saturação & Nitidez da Área de Trabalho (Windows Desktop)
+            HWND hLblDesktop = CreateWindowW(L"STATIC", L"Padrão do Windows (Quando nenhum jogo estiver focado):", WS_CHILD | SS_LEFT | SS_NOPREFIX, 320, 505, 420, 18, hwnd, NULL, NULL, NULL);
+            
+            HWND hLblDeskVib = CreateWindowW(L"STATIC", L"Vibrance:", WS_CHILD | SS_LEFT | SS_NOPREFIX, 320, 530, 70, 18, hwnd, NULL, NULL, NULL);
+            HWND hLblDeskVal = CreateWindowW(L"STATIC", L"50%", WS_CHILD | SS_RIGHT | SS_NOPREFIX, 470, 530, 40, 18, hwnd, (HMENU)IDC_LBL_DESKTOP_VIB_VAL, NULL, NULL);
+            HWND hSliderDesk = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | TBS_NOTICKS, 320, 548, 195, 26, hwnd, (HMENU)IDC_SLIDER_DESKTOP_VIB, NULL, NULL);
+            SendMessageW(hSliderDesk, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+            SendMessageW(hSliderDesk, TBM_SETPOS, TRUE, g_settings.windowsVibrance);
 
-            HWND hChkAutostart = CreateWindowW(L"BUTTON", L"Iniciar junto com o Windows", WS_CHILD | BS_AUTOCHECKBOX, 320, 528, 230, 20, hwnd, (HMENU)IDC_CHK_AUTOSTART, NULL, NULL);
+            HWND hLblDeskSharp = CreateWindowW(L"STATIC", L"Nitidez:", WS_CHILD | SS_LEFT | SS_NOPREFIX, 530, 530, 60, 18, hwnd, NULL, NULL, NULL);
+            HWND hLblDeskSharpVal = CreateWindowW(L"STATIC", L"50%", WS_CHILD | SS_RIGHT | SS_NOPREFIX, 660, 530, 40, 18, hwnd, (HMENU)IDC_LBL_DESKTOP_SHARP_VAL, NULL, NULL);
+            HWND hSliderDeskSharp = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | TBS_NOTICKS, 530, 548, 175, 26, hwnd, (HMENU)IDC_SLIDER_DESKTOP_SHARP, NULL, NULL);
+            SendMessageW(hSliderDeskSharp, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+            SendMessageW(hSliderDeskSharp, TBM_SETPOS, TRUE, g_settings.windowsSharpness);
+
+            HWND hBtnResetDesk = CreateWindowW(L"BUTTON", L"Restaurar", WS_CHILD | BS_OWNERDRAW, 715, 536, 95, 36, hwnd, (HMENU)IDC_BTN_TEST_DESKTOP, NULL, NULL);
+
+            HWND hChkAutostart = CreateWindowW(L"BUTTON", L"Iniciar com o Windows", WS_CHILD | BS_AUTOCHECKBOX, 320, 595, 230, 20, hwnd, (HMENU)IDC_CHK_AUTOSTART, NULL, NULL);
             SendMessageW(hChkAutostart, BM_SETCHECK, g_settings.startWithWindows ? BST_CHECKED : BST_UNCHECKED, 0);
 
-            HWND hChkMinTray = CreateWindowW(L"BUTTON", L"Minimizar para a bandeja ao fechar (Botão X)", WS_CHILD | BS_AUTOCHECKBOX, 560, 528, 240, 20, hwnd, (HMENU)IDC_CHK_MINIMIZE_TRAY, NULL, NULL);
+            HWND hChkMinTray = CreateWindowW(L"BUTTON", L"Minimizar para a bandeja ao fechar (X)", WS_CHILD | BS_AUTOCHECKBOX, 550, 595, 260, 20, hwnd, (HMENU)IDC_CHK_MINIMIZE_TRAY, NULL, NULL);
             SendMessageW(hChkMinTray, BM_SETCHECK, g_settings.minimizeToTrayOnClose ? BST_CHECKED : BST_UNCHECKED, 0);
 
             g_tabMainControls = {hLblList, hList, hBtnAdd, hBtnRemove, hLblSectionGame, hLblName, hEditName,
                                  hLblExe, hEditExe, hBtnDetect, hBtnBrowse, hLblVib, hLblVibVal, hSliderVib,
-                                 hBtnTestGame, hChkWin, hChkEn, hLblDesktop, hLblDesktopVal, hSliderDesktop,
-                                 hBtnTestDesktop, hChkAutostart, hChkMinTray};
+                                 hLblSharp, hLblSharpVal, hSliderSharp, hBtnTestGameVib, hBtnTestGameSharp,
+                                 hChkWin, hChkEn, hLblDesktop, hLblDeskVib, hLblDeskVal, hSliderDesk,
+                                 hLblDeskSharp, hLblDeskSharpVal, hSliderDeskSharp, hBtnResetDesk,
+                                 hChkAutostart, hChkMinTray};
 
-            // Rodapé: Status Bar e Rastreador ao Vivo
-            HWND hStatusBadge = CreateWindowW(L"STATIC", L"🟢 STATUS: Área de Trabalho (Saturação: 50%)", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, 25, 608, 450, 22, hwnd, (HMENU)IDC_STATUS_BADGE, NULL, NULL);
+            // Rodapé
+            HWND hStatusBadge = CreateWindowW(L"STATIC", L"🟢 STATUS: Área de Trabalho (Vibrance: 50% | Nitidez: 50%)", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, 25, 665, 450, 22, hwnd, (HMENU)IDC_STATUS_BADGE, NULL, NULL);
             SendMessageW(hStatusBadge, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
 
-            HWND hLiveTracker = CreateWindowW(L"STATIC", L"Janela Ativa Detectada: [ explorer.exe ]", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_NOPREFIX, 480, 608, 335, 22, hwnd, (HMENU)IDC_LIVE_TRACKER, NULL, NULL);
+            HWND hLiveTracker = CreateWindowW(L"STATIC", L"Janela Ativa: [ explorer.exe ]", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_NOPREFIX, 480, 665, 345, 22, hwnd, (HMENU)IDC_LIVE_TRACKER, NULL, NULL);
             SendMessageW(hLiveTracker, WM_SETFONT, (WPARAM)g_fontSmall, TRUE);
 
             // Aplicar Fontes
@@ -948,7 +1049,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int pos = (int)SendMessageW(hScroll, TBM_GETPOS, 0, 0);
             std::wstring valStr = std::to_wstring(pos) + L"%";
 
-            // Slider do Jogo Selecionado
+            // Saturação do Jogo
             if (hScroll == GetDlgItem(hwnd, IDC_SLIDER_GAME_VIB)) {
                 SetWindowTextW(GetDlgItem(hwnd, IDC_LBL_GAME_VIB_VAL), valStr.c_str());
                 if (g_selectedProfileIndex >= 0 && g_selectedProfileIndex < (int)g_settings.profiles.size()) {
@@ -956,22 +1057,42 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     SaveSettings();
                     RefreshProfileList();
 
-                    // Se este jogo estiver em foco agora, aplicar imediatamente
                     if (g_isGameActive && g_activeGameName == g_settings.profiles[g_selectedProfileIndex].name) {
                         ApplyVibrancePercent(pos);
                     }
                 }
             }
-            // Slider da Área de Trabalho (Windows Desktop)
+            // Nitidez do Jogo
+            else if (hScroll == GetDlgItem(hwnd, IDC_SLIDER_GAME_SHARP)) {
+                SetWindowTextW(GetDlgItem(hwnd, IDC_LBL_GAME_SHARP_VAL), valStr.c_str());
+                if (g_selectedProfileIndex >= 0 && g_selectedProfileIndex < (int)g_settings.profiles.size()) {
+                    g_settings.profiles[g_selectedProfileIndex].sharpness = pos;
+                    SaveSettings();
+                    RefreshProfileList();
+
+                    if (g_isGameActive && g_activeGameName == g_settings.profiles[g_selectedProfileIndex].name) {
+                        ApplyMonitorSharpnessPercent(pos);
+                    }
+                }
+            }
+            // Saturação do Desktop
             else if (hScroll == GetDlgItem(hwnd, IDC_SLIDER_DESKTOP_VIB)) {
                 SetWindowTextW(GetDlgItem(hwnd, IDC_LBL_DESKTOP_VIB_VAL), valStr.c_str());
                 g_settings.windowsVibrance = pos;
                 SaveSettings();
 
-                // Se nenhum jogo estiver em foco, aplicar imediatamente ao desktop
                 if (!g_isGameActive) {
                     ApplyVibrancePercent(pos);
-                    UpdateStatusUI(L"Área de Trabalho (Saturação: " + std::to_wstring(pos) + L"%)", false);
+                }
+            }
+            // Nitidez do Desktop
+            else if (hScroll == GetDlgItem(hwnd, IDC_SLIDER_DESKTOP_SHARP)) {
+                SetWindowTextW(GetDlgItem(hwnd, IDC_LBL_DESKTOP_SHARP_VAL), valStr.c_str());
+                g_settings.windowsSharpness = pos;
+                SaveSettings();
+
+                if (!g_isGameActive) {
+                    ApplyMonitorSharpnessPercent(pos);
                 }
             }
             break;
@@ -1013,7 +1134,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     RefreshProfileList();
                 }
             }
-            // Checkbox Modo Janela
+            // Checkboxes
             else if (wmId == IDC_CHK_WINDOWED) {
                 if (g_selectedProfileIndex >= 0 && g_selectedProfileIndex < (int)g_settings.profiles.size()) {
                     bool chk = (SendMessageW(GetDlgItem(hwnd, IDC_CHK_WINDOWED), BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -1021,7 +1142,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     SaveSettings();
                 }
             }
-            // Checkbox Perfil Habilitado
             else if (wmId == IDC_CHK_PROFILE_ENABLED) {
                 if (g_selectedProfileIndex >= 0 && g_selectedProfileIndex < (int)g_settings.profiles.size()) {
                     bool chk = (SendMessageW(GetDlgItem(hwnd, IDC_CHK_PROFILE_ENABLED), BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -1030,16 +1150,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     RefreshProfileList();
                 }
             }
-            // Botão Adicionar Jogo
+            // Botões Adicionar / Remover Jogo
             else if (wmId == IDC_BTN_ADD_GAME) {
-                GameProfile newGame = {L"Novo Jogo", L"jogo.exe", 100, true, true};
+                GameProfile newGame = {L"Novo Jogo", L"jogo.exe", 100, 80, true, true};
                 g_settings.profiles.push_back(newGame);
                 g_selectedProfileIndex = (int)g_settings.profiles.size() - 1;
                 SaveSettings();
                 RefreshProfileList();
                 LoadSelectedProfileToInputs();
             }
-            // Botão Remover Jogo
             else if (wmId == IDC_BTN_REMOVE_GAME) {
                 if (g_selectedProfileIndex >= 0 && g_selectedProfileIndex < (int)g_settings.profiles.size()) {
                     g_settings.profiles.erase(g_settings.profiles.begin() + g_selectedProfileIndex);
@@ -1051,45 +1170,52 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     LoadSelectedProfileToInputs();
                 }
             }
-            // Botão Detectar Processos Abertos
             else if (wmId == IDC_BTN_DETECT_RUNNING) {
                 ShowRunningProcessesDialog(hwnd);
             }
-            // Botão Procurar Executável
             else if (wmId == IDC_BTN_BROWSE_EXE) {
                 BrowseExeFile(hwnd);
             }
-            // Botão Testar Saturação do Jogo
+            // Teste de Saturação do Jogo
             else if (wmId == IDC_BTN_TEST_GAME_VIB) {
                 if (g_selectedProfileIndex >= 0 && g_selectedProfileIndex < (int)g_settings.profiles.size()) {
                     int vib = g_settings.profiles[g_selectedProfileIndex].vibrance;
                     ApplyVibrancePercent(vib);
-                    UpdateStatusUI(L"TESTE: " + g_settings.profiles[g_selectedProfileIndex].name + L" (" + std::to_wstring(vib) + L"%)", true);
+                    UpdateStatusUI(L"TESTE: " + g_settings.profiles[g_selectedProfileIndex].name + L" (Saturação: " + std::to_wstring(vib) + L"%)", true);
                 }
             }
-            // Botão Restaurar Desktop
-            else if (wmId == IDC_BTN_TEST_DESKTOP_VIB) {
-                ApplyVibrancePercent(g_settings.windowsVibrance);
-                g_isGameActive = false;
-                UpdateStatusUI(L"Área de Trabalho (Saturação: " + std::to_wstring(g_settings.windowsVibrance) + L"%)", false);
+            // Teste de Nitidez do Jogo
+            else if (wmId == IDC_BTN_TEST_GAME_SHARP) {
+                if (g_selectedProfileIndex >= 0 && g_selectedProfileIndex < (int)g_settings.profiles.size()) {
+                    int sharp = g_settings.profiles[g_selectedProfileIndex].sharpness;
+                    ApplyMonitorSharpnessPercent(sharp);
+                    UpdateStatusUI(L"TESTE: Nitidez do Monitor AOC (" + std::to_wstring(sharp) + L"%)", true);
+                }
             }
-            // Checkbox Autostart
+            // Restaurar Desktop
+            else if (wmId == IDC_BTN_TEST_DESKTOP) {
+                ApplyVibrancePercent(g_settings.windowsVibrance);
+                ApplyMonitorSharpnessPercent(g_settings.windowsSharpness);
+                g_isGameActive = false;
+                UpdateStatusUI(L"Área de Trabalho (Vibrance: " + std::to_wstring(g_settings.windowsVibrance) + 
+                               L"% | Nitidez: " + std::to_wstring(g_settings.windowsSharpness) + L"%)", false);
+            }
             else if (wmId == IDC_CHK_AUTOSTART) {
                 g_settings.startWithWindows = (SendMessageW(GetDlgItem(hwnd, IDC_CHK_AUTOSTART), BM_GETCHECK, 0, 0) == BST_CHECKED);
                 SaveSettings();
             }
-            // Checkbox Minimizar para Bandeja
             else if (wmId == IDC_CHK_MINIMIZE_TRAY) {
                 g_settings.minimizeToTrayOnClose = (SendMessageW(GetDlgItem(hwnd, IDC_CHK_MINIMIZE_TRAY), BM_GETCHECK, 0, 0) == BST_CHECKED);
                 SaveSettings();
             }
-            // Menu da Bandeja
+            // Tray
             else if (wmId == IDM_TRAY_OPEN) {
                 ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
             }
             else if (wmId == IDM_TRAY_RESTORE_WIN) {
                 ApplyVibrancePercent(g_settings.windowsVibrance);
+                ApplyMonitorSharpnessPercent(g_settings.windowsSharpness);
                 g_isGameActive = false;
             }
             else if (wmId == IDM_TRAY_EXIT) {
@@ -1098,55 +1224,53 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
 
-        case WM_APP_TRAY:
-            if (lParam == WM_RBUTTONUP) {
-                POINT pt;
-                GetCursorPos(&pt);
-                ShowTrayMenu(hwnd, pt);
-            } else if (lParam == WM_LBUTTONDBLCLK) {
-                ShowWindow(hwnd, SW_RESTORE);
-                SetForegroundWindow(hwnd);
-            }
-            break;
-
-        case WM_CTLCOLOREDIT: {
-            HDC hdcEdit = (HDC)wParam;
-            SetBkColor(hdcEdit, RGB(34, 34, 46));
-            SetTextColor(hdcEdit, RGB(255, 255, 255));
-            return (LRESULT)g_hBrushInput;
-        }
-
-        case WM_CTLCOLORLISTBOX: {
-            HDC hdcList = (HDC)wParam;
-            SetBkColor(hdcList, RGB(26, 26, 36));
-            SetTextColor(hdcList, RGB(240, 240, 245));
-            return (LRESULT)g_hBrushCard;
-        }
-
         case WM_CTLCOLORSTATIC: {
             HDC hdcStatic = (HDC)wParam;
             HWND hCtrl = (HWND)lParam;
+            int id = GetDlgCtrlID(hCtrl);
+
             SetBkMode(hdcStatic, TRANSPARENT);
 
-            if (hCtrl == GetDlgItem(hwnd, IDC_LBL_GAME_VIB_VAL)) {
-                SetTextColor(hdcStatic, RGB(56, 189, 248)); // Azul Céu
-            } else if (hCtrl == GetDlgItem(hwnd, IDC_LBL_DESKTOP_VIB_VAL)) {
-                SetTextColor(hdcStatic, RGB(167, 139, 250)); // Roxo Suave
-            } else if (hCtrl == GetDlgItem(hwnd, IDC_STATUS_BADGE)) {
-                SetTextColor(hdcStatic, g_isGameActive ? RGB(56, 189, 248) : RGB(74, 222, 128));
-            } else if (hCtrl == GetDlgItem(hwnd, IDC_LIVE_TRACKER) || hCtrl == GetDlgItem(hwnd, IDC_GPU_LABEL)) {
-                SetTextColor(hdcStatic, RGB(156, 163, 175));
-            } else {
-                SetTextColor(hdcStatic, RGB(235, 235, 242));
+            if (id == IDC_STATUS_BADGE) {
+                SetTextColor(hdcStatic, g_isGameActive ? RGB(74, 222, 128) : RGB(56, 189, 248));
+                return (INT_PTR)g_hBrushBg;
+            }
+            if (id == IDC_GPU_LABEL || id == IDC_LIVE_TRACKER) {
+                SetTextColor(hdcStatic, RGB(148, 163, 184));
+                return (INT_PTR)g_hBrushBg;
+            }
+            if (id == IDC_LBL_GAME_VIB_VAL || id == IDC_LBL_GAME_SHARP_VAL ||
+                id == IDC_LBL_DESKTOP_VIB_VAL || id == IDC_LBL_DESKTOP_SHARP_VAL) {
+                SetTextColor(hdcStatic, RGB(56, 189, 248));
+                return (INT_PTR)g_hBrushCard;
             }
 
-            return (LRESULT)g_hBrushCard;
+            SetTextColor(hdcStatic, RGB(220, 220, 230));
+            return (INT_PTR)g_hBrushCard;
         }
+
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX: {
+            HDC hdcCtrl = (HDC)wParam;
+            SetBkColor(hdcCtrl, RGB(34, 34, 46));
+            SetTextColor(hdcCtrl, RGB(245, 245, 250));
+            return (INT_PTR)g_hBrushInput;
+        }
+
+        case WM_APP_TRAY:
+            if (lParam == WM_LBUTTONDBLCLK) {
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            } else if (lParam == WM_RBUTTONUP) {
+                POINT pt;
+                GetCursorPos(&pt);
+                ShowTrayMenu(hwnd, pt);
+            }
+            break;
 
         case WM_CLOSE:
             if (g_settings.minimizeToTrayOnClose) {
                 ShowWindow(hwnd, SW_HIDE);
-                g_nid.uFlags |= NIF_INFO;
                 wcsncpy(g_nid.szInfo, L"VibranceApp continua ativo monitorando seus jogos em segundo plano.", sizeof(g_nid.szInfo)/sizeof(WCHAR)-1);
                 wcsncpy(g_nid.szInfoTitle, L"VibranceApp Ativo", sizeof(g_nid.szInfoTitle)/sizeof(WCHAR)-1);
                 g_nid.dwInfoFlags = NIIF_INFO;
@@ -1164,6 +1288,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd, IDT_POLL_TIMER);
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             ApplyVibrancePercent(g_settings.windowsVibrance);
+            ApplyMonitorSharpnessPercent(g_settings.windowsSharpness);
+            CleanupDdcMonitors();
             UnloadNVAPI();
 
             if (g_fontTitle) DeleteObject(g_fontTitle);
@@ -1200,13 +1326,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     InitCommonControlsEx(&icc);
 
     LoadSettings();
-
-    if (!InitNVAPI()) {
-        MessageBoxW(NULL,
-                    L"Aviso: Não foi possível conectar diretamente à API NVIDIA (NVAPI).\n"
-                    L"O aplicativo funcionará em modo demonstração e teste de interface.",
-                    L"Aviso de Hardware", MB_OK | MB_ICONWARNING);
-    }
+    InitNVAPI();
+    InitDdcMonitors();
 
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.lpfnWndProc = WndProc;
@@ -1217,9 +1338,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     wc.lpszClassName = L"VibranceAppMainWindowClass";
     RegisterClassExW(&wc);
 
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"VibranceApp - Controle de Saturação para Jogos",
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"VibranceApp - Saturação & Nitidez Automática para Jogos",
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                CW_USEDEFAULT, CW_USEDEFAULT, 850, 680, NULL, NULL, hInstance, NULL);
+                                CW_USEDEFAULT, CW_USEDEFAULT, 860, 740, NULL, NULL, hInstance, NULL);
 
     if (!hwnd) {
         if (g_hMutex) CloseHandle(g_hMutex);

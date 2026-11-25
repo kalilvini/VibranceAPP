@@ -1,0 +1,8 @@
+Windows Registry Editor Version 5.00
+
+; VibranceApp - Restaurar padrão original da NVIDIA (NIS padrão)
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\nvlddmkm\FTS]
+"EnableGR535"=dword:00000001
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\nvlddmkm\Parameters\FTS]
+"EnableGR535"=dword:00000001

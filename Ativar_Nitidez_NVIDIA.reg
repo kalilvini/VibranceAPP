@@ -1,0 +1,11 @@
+Windows Registry Editor Version 5.00
+
+; VibranceApp - Reativar o slider nativo de Nitidez (Image Sharpening) no Painel da NVIDIA
+; Compatível com drivers modernos NVIDIA GeForce (RTX 3060 Ti e similares)
+; Local 1: Serviço nvlddmkm
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\nvlddmkm\FTS]
+"EnableGR535"=dword:00000000
+
+; Local 2: Parâmetros adicionais do driver
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\nvlddmkm\Parameters\FTS]
+"EnableGR535"=dword:00000000
